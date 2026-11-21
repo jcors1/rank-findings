@@ -77,6 +77,9 @@
 //     "window": { "from", "to", "days", "now", "timeZone", "dates": [...] },
 //     "input": { "comments", "scorecards", "withoutScorecard",
 //                "unreadable": [ { "created", "reason" } ] },
+//     "measuringFrom": the date of the first scorecard block in the comments
+//                (the earliest "date:" line, a review block's included), or
+//                null when there is none,
 //     "days": [ { "date", "runs": [ <run> ] } ],     one per date in the window
 //     "missingDaily": [ dates in the window with no daily scorecard ],
 //     "duplicates": [ { "run", "date", "created": [...] } ],
@@ -95,10 +98,14 @@
 //     "inputsGiven": { "required", "targets", "auditStories" },
 //     "confidence": { "from", "to", "days", "found", "assessed", "actionable",
 //                     "overall", "weeks": [ the same for four ISO weeks ] },
-//     "reports": [ { "date", "run", "report", "found", "assessed",
-//                    "actionable", "overall", "stories", "misses" } ],
+//     "reports": [ { "date", "run", "report", "beforeMeasuring", "found",
+//                    "assessed", "actionable", "overall", "stories",
+//                    "misses" } ],
 //     "misses": [ { "key", "foundBy", "available", "chargedTo", "report",
 //                   "inGrid" } ],
+//       "report" is "daily", "no report", "not yet due", "not charged" (no
+//       Available date) or "before measuring began" (available before
+//       "measuringFrom"; charged to no report, still in the catch rate).
 //     "changed": [ { "key", "changes": [ { "field", "first", "final" } ] } ],
 //     "timeToSurface": [ { "how", "days", "median" } ],
 //     "sourcesRead": [ { "source", "read", "failed", "unknown", "required" } ],
@@ -114,6 +121,13 @@
 // "reason" when it has no data }. "score" is a whole number 0 to 100, or
 // "not enough data"; "band" is High, Medium, Low or "not enough data".
 // "overall" is the lowest principle with a score, and "from" names it.
+// Since the amendment of 2026-11-21 (handoff
+// 2026-11-21-confidence-metrics-and-review): "Required sources" counts only
+// the dates on or after "measuringFrom" and also gives
+// "daysBeforeMeasuring"; a grid date before it shows "before measuring", not
+// "no report"; "Verdict agreement" scores only proposals of affected or
+// not-affected, and gives "leftToOwner" (proposed needs-info or watch) out of
+// "withBoth" (stories with both a proposed-* and a verdict-* label).
 // <run> is one scorecard: "run", "date", "created", "procedureCommit",
 // "status" (VALID, FAILED or "unknown"), "sourcesListed", "readInFull",
 // "readInPart", "searchedOnly", "couldNotCheck", "inventoryRead", "events",
@@ -529,10 +543,15 @@ function lowest(parts) {
   return { score: p.score, band: band(p.score), from };
 }
 
+// Only definite proposals are scored (amendment of 2026-11-21): a story
+// proposed as needs-info or watch is counted in "leftToOwner", out of
+// "withBoth", the stories with both labels.
+const DEFINITE = ['affected', 'not-affected'];
 function verdictAgreementOf(list) {
   const both = list.filter((s) => s.proposed !== NR && s.verdict !== NR);
-  const disagree = both.filter((s) => s.proposed !== s.verdict).map((s) => s.key);
-  return measure(both.length - disagree.length, both.length, { leftOut: list.length - both.length, disagree });
+  const definite = both.filter((s) => DEFINITE.includes(s.proposed));
+  const disagree = definite.filter((s) => s.proposed !== s.verdict).map((s) => s.key);
+  return measure(definite.length - disagree.length, definite.length, { leftOut: list.length - both.length, disagree, leftToOwner: both.length - definite.length, withBoth: both.length });
 }
 
 function heldUpOf(list) {
@@ -567,6 +586,20 @@ const dailyOn = (cards, date) => cards.filter((c) => c.run === 'daily' && c.date
 const requiredRead = (card, required) => Array.isArray(card.sources)
   && required.every((name) => card.sources.some((s) => sourceKey(s.name) === sourceKey(name) && READ.includes(s.result)));
 
+// Required sources over the dates on or after the start of measuring (the
+// first scorecard in the run log): a date before it is not a failed day.
+const measuring = (ctx, date) => ctx.measuringFrom !== null && date >= ctx.measuringFrom;
+function requiredSourcesOf(ctx, dates) {
+  if (ctx.required === undefined) return noData('no list of required sources given (--required)');
+  const counted = dates.filter((date) => measuring(ctx, date));
+  const daysBeforeMeasuring = dates.length - counted.length;
+  if (counted.length === 0) {
+    return noData(ctx.measuringFrom === null ? 'no scorecard in the run log yet, so measuring has not begun' : `every day of the window is before measuring began (${ctx.measuringFrom})`, { leftOut: 0, daysWithoutScorecard: 0, daysBeforeMeasuring });
+  }
+  const passed = counted.filter((date) => { const card = dailyOn(ctx.cards, date); return card !== undefined && requiredRead(card, ctx.required); });
+  return measure(passed.length, counted.length, { leftOut: 0, daysWithoutScorecard: counted.filter((date) => dailyOn(ctx.cards, date) === undefined).length, daysBeforeMeasuring });
+}
+
 // The three principles and Overall over the SCORE_DAYS dates ending on `to`.
 function scoresFor(ctx, to) {
   const from = dateOf(dayNumber(to) - (SCORE_DAYS - 1));
@@ -582,10 +615,7 @@ function scoresFor(ctx, to) {
   const found = principle({
     catchRate: measure(daily.length, scoped.length, { leftOut: inWindow.filter((s) => s.foundBy === NR).length }),
     coverage: measure(counted.reduce((n, r) => n + r.covered, 0), counted.reduce((n, r) => n + r.relevant, 0), { leftOut: reviews.length - counted.length, reviews: reviews.length }),
-    requiredSources: ctx.required === undefined
-      ? noData('no list of required sources given (--required)')
-      : measure(dates.filter((date) => { const card = dailyOn(ctx.cards, date); return card !== undefined && requiredRead(card, ctx.required); }).length, SCORE_DAYS,
-        { leftOut: 0, daysWithoutScorecard: dates.filter((date) => dailyOn(ctx.cards, date) === undefined).length }),
+    requiredSources: requiredSourcesOf(ctx, dates),
     onTime: measure(known.filter((s) => dayNumber(s.createdDate) - dayNumber(s.available.date) <= 1).length, known.length, { leftOut: daily.length - known.length }),
   }, FOUND_WEIGHTS);
 
@@ -601,12 +631,16 @@ function scoresFor(ctx, to) {
 }
 
 // Each miss (a story found by the audit or the owner) is charged to the daily
-// report due the day after it became available.
+// report due the day after it became available, unless it became available
+// before measuring began: then it is charged to no report.
+const BEFORE = 'before measuring';
+const BEFORE_BEGAN = 'before measuring began';
 function missesOf(ctx, to) {
   return ctx.stories
     .filter((s) => s.foundBy === 'audit' || s.foundBy === 'owner')
     .map((s) => {
       if (s.available === NR || s.available === 'unknown') return { key: s.key, foundBy: s.foundBy, available: s.available, chargedTo: null, report: 'not charged' };
+      if (!measuring(ctx, s.available.date)) return { key: s.key, foundBy: s.foundBy, available: s.available.date, chargedTo: null, report: BEFORE_BEGAN };
       const chargedTo = dateOf(dayNumber(s.available.date) + 1);
       const report = chargedTo > to ? 'not yet due' : dailyOn(ctx.cards, chargedTo) ? 'daily' : 'no report';
       return { key: s.key, foundBy: s.foundBy, available: s.available.date, chargedTo, report };
@@ -617,8 +651,9 @@ function missesOf(ctx, to) {
 function reportRow(ctx, card, date, run, misses) {
   const charged = run === 'daily' ? misses.filter((m) => m.chargedTo === date).map((m) => m.key) : [];
   if (!card) {
-    const none = { score: 'no report', band: 'no report' };
-    return { date, run, report: false, found: none, assessed: none, actionable: none, overall: none, stories: [], misses: charged };
+    const word = measuring(ctx, date) ? 'no report' : BEFORE;
+    const none = { score: word, band: word };
+    return { date, run, report: false, beforeMeasuring: word === BEFORE, found: none, assessed: none, actionable: none, overall: none, stories: [], misses: charged };
   }
   const own = run === 'daily' ? ctx.stories.filter((s) => s.foundBy === 'daily' && s.createdDate === date) : [];
   let found;
@@ -641,7 +676,7 @@ function reportRow(ctx, card, date, run, misses) {
   const actionable = part({ concreteStep: concreteStepOf(affected), noExtraResearch: noExtraResearchOf(affected), fixedInTime: fixedInTimeOf(affected, ctx.targets) }, own.some((s) => !(s.closed && s.final !== NR)));
   const overall = lowest({ found, assessed, actionable });
   overall.provisional = assessed.provisional || actionable.provisional;
-  return { date, run, report: true, duplicate: card.duplicate, found, assessed, actionable, overall, stories: own.map((s) => s.key), misses: charged };
+  return { date, run, report: true, beforeMeasuring: false, duplicate: card.duplicate, found, assessed, actionable, overall, stories: own.map((s) => s.key), misses: charged };
 }
 
 const median = (sorted) => (sorted.length === 0 ? null : sorted.length % 2 ? sorted[(sorted.length - 1) / 2] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2);
@@ -807,7 +842,8 @@ function reviewOf(ctx, to) {
     glance: {
       reportCard: {
         dailyReports: dailyReports.filter((r) => r.report).length,
-        noReport: dailyReports.filter((r) => !r.report).map((r) => r.date),
+        noReport: dailyReports.filter((r) => !r.report && !r.beforeMeasuring).map((r) => r.date),
+        beforeMeasuring: dailyReports.filter((r) => r.beforeMeasuring).map((r) => r.date),
         lowestFound: scoredReports.length === 0 ? null : (({ date, found }) => ({ date, score: found.score, band: found.band }))(scoredReports.reduce((low, r) => (r.found.score < low.found.score ? r : low))),
         missesInGrid: misses.filter((m) => m.inGrid).length,
       },
@@ -960,13 +996,18 @@ export function rollup({ comments, stories, days, now, required, targets, auditS
   reviews.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.createdMs - b.createdMs));
   const reviewWeeks = new Map();
   for (const r of reviews) reviewWeeks.set(r.week, (reviewWeeks.get(r.week) ?? 0) + 1);
-  const review = reviewOf({ cards: ordered, stories: parsed, reviews, required: requiredList, targets: targetDays, auditStories: auditKeys }, to);
+  // Measuring starts on the date of the first scorecard in the run log: the
+  // earliest "date:" of every readable block, the review's included.
+  const blockDates = [...ordered.map((card) => card.date), ...reviews.map((r) => r.date)].sort();
+  const measuringFrom = blockDates[0] ?? null;
+  const review = reviewOf({ cards: ordered, stories: parsed, reviews, required: requiredList, targets: targetDays, auditStories: auditKeys, measuringFrom }, to);
   const shapes = new Set(parsed.map((s) => (s.oldShape ? 'open stories only' : 'full')));
 
   return {
     generatedBy: NAME,
     window: { from: dates[0], to, days, now: new Date(nowMs).toISOString(), timeZone: TIME_ZONE, dates },
     input: { comments: comments.length, scorecards: ordered.length, withoutScorecard, unreadable },
+    measuringFrom,
     days: byDay,
     missingDaily: byDay.filter((day) => !day.runs.some((card) => card.run === 'daily')).map((day) => day.date),
     duplicates,
@@ -1246,7 +1287,7 @@ ${PRINCIPLES.map(([name, title, question]) => principleBlock(title, question, c[
   const rc = g.reportCard;
   const weakest = g.weakest;
   out.push(`<section><h2>At a glance</h2><ul class="glance">
-<li><b>Report card:</b> ${plural(rc.dailyReports, 'daily report', 'daily reports')} in the last 8 days${rc.noReport.length ? `; no report on ${rc.noReport.map(esc).join(', ')}` : '; none missing'}. ${rc.lowestFound ? `Lowest Found for one report: ${num(rc.lowestFound.score)} ${esc(rc.lowestFound.band)} (${esc(rc.lowestFound.date)}).` : 'No report has a Found score.'} ${plural(rc.missesInGrid, 'miss is', 'misses are')} charged to these days.</li>
+<li><b>Report card:</b> ${plural(rc.dailyReports, 'daily report', 'daily reports')} in the last 8 days${rc.noReport.length ? `; no report on ${rc.noReport.map(esc).join(', ')}` : '; none missing'}${rc.beforeMeasuring.length ? `; ${plural(rc.beforeMeasuring.length, 'day was', 'days were')} before measuring began` : ''}. ${rc.lowestFound ? `Lowest Found for one report: ${num(rc.lowestFound.score)} ${esc(rc.lowestFound.band)} (${esc(rc.lowestFound.date)}).` : 'No report has a Found score.'} ${plural(rc.missesInGrid, 'miss is', 'misses are')} charged to these days.</li>
 <li><b>Found by the audit:</b> ${g.foundByAudit === 'not given' ? 'not given: the run passed no list of its new stories.' : `${plural(g.foundByAudit, 'story', 'stories')} this run.`}</li>
 <li><b>Your exposure:</b> ${plural(g.exposure.open, 'open story', 'open stories')}; ${plural(g.exposure.openAffected, 'is', 'are')} affected and not yet closed.</li>
 <li><b>Weakest principle:</b> ${weakest.from ? `${esc(PRINCIPLES.find(([n]) => n === weakest.from)[1])}, ${num(weakest.score)} ${esc(weakest.band)}.` : 'not enough data.'}</li>
@@ -1265,7 +1306,7 @@ function reportCardPart(metrics) {
     return `<tr><td class="nw">${esc(r.date)}</td><td class="nw">${esc(r.run)}${r.duplicate ? ' (two scorecards: newest used)' : ''}</td><td>${reportCell(f, detail)}</td><td>${reportCell(r.assessed)}</td><td>${reportCell(r.actionable)}</td><td>${reportCell(r.overall)}</td><td>${r.stories.length ? `stories: ${r.stories.map(esc).join(', ')}` : ''}${r.misses.length ? `${r.stories.length ? '<br>' : ''}missed: ${r.misses.map(esc).join(', ')}` : ''}</td></tr>`;
   });
   const uncharged = metrics.misses.filter((m) => !m.inGrid);
-  out.push(`<section><h2>Each report, last 8 days</h2><p class="sub">The daily light check on every date, and each digest. "n/a": the report created no story. "provisional": the owner has not finished with its stories yet.</p>
+  out.push(`<section><h2>Each report, last 8 days</h2><p class="sub">The daily light check on every date, and each digest. "n/a": the report created no story. "provisional": the owner has not finished with its stories yet. "before measuring": a day before the run log's first scorecard${metrics.measuringFrom ? ` (${esc(metrics.measuringFrom)})` : ''}; it is not a missing report.</p>
 <table><thead><tr><th class="nw">Date</th><th class="nw">Run</th><th>Found</th><th>Assessed</th><th>Actionable</th><th>Overall</th><th>Stories and misses</th></tr></thead><tbody>${rows.join('\n')}</tbody></table>
 ${uncharged.length ? `<p class="small">Misses not charged to these 8 days: ${uncharged.map((m) => `${esc(m.key)} (${m.chargedTo ? `charged to ${esc(m.chargedTo)}, ${esc(m.report)}` : esc(m.report)})`).join('; ')}.</p>` : ''}</section>`);
 
@@ -1280,7 +1321,7 @@ ${legend([[0, 's1', 'daily light check'], [0, 's2', 'Friday audit'], [0, 's3', '
 
   const srcScale = Math.max(1, ...metrics.sourcesRead.map((s) => s.read + s.failed + s.unknown));
   const req = c.found.measures.requiredSources;
-  out.push(`<section><h2>Sources read by the daily check</h2><p class="sub">Runs in the scoring window in which each source was read (in full or in part) or failed (searched only, or could not check). Required sources: ${countsWords(req)} of days with every required source read${req.daysWithoutScorecard ? `; ${plural(req.daysWithoutScorecard, 'day has', 'days have')} no daily scorecard and count as failed` : ''}.</p>
+  out.push(`<section><h2>Sources read by the daily check</h2><p class="sub">Runs in the scoring window in which each source was read (in full or in part) or failed (searched only, or could not check). Required sources: ${countsWords(req)} of days with every required source read${req.daysWithoutScorecard ? `; ${plural(req.daysWithoutScorecard, 'day has', 'days have')} no daily scorecard and count as failed` : ''}${req.daysBeforeMeasuring ? `; ${plural(req.daysBeforeMeasuring, 'day is', 'days are')} before measuring began and not counted` : ''}.</p>
 ${legend([[0, 'good', 'read'], [0, 'critical', 'failed'], [0, 'none', 'result unknown']])}
 ${metrics.sourcesRead.length ? `<table><tbody>${metrics.sourcesRead.map((s) => { const parts = [[s.read, 'good', 'read'], [s.failed, 'critical', 'failed'], [s.unknown, 'none', 'unknown']]; return `<tr><td>${esc(s.source)}${s.required ? ' <b>(required)</b>' : ''}</td><td>${hbar(parts, srcScale, 220)}</td><td>${partsWords(parts.filter(([v]) => v > 0))}</td></tr>`; }).join('')}</tbody></table>` : '<p class="muted">No daily scorecard with source lines in the window.</p>'}</section>`);
 
@@ -1328,7 +1369,7 @@ ${metrics.sourcesRead.length ? `<table><tbody>${metrics.sourcesRead.map((s) => {
   out.push(`<section><h2>Time to surface</h2><p class="sub">Days from the story's Available date to the day it was logged, one dot per news-watch story, by how the item became available. On time (daily check, 1 day or less): ${countsWords(onTime)}.</p>${ttsChart}</section>`);
 
   const va = c.assessed.measures.verdictAgreement;
-  let ring = '<p class="muted">No story has both a proposed and a confirmed verdict yet.</p>';
+  let ring = `<p class="muted">No story has both a definite proposed verdict (affected or not affected) and a confirmed one yet.</p>`;
   if (va.hasData) {
     const r = 44;
     const circ = 2 * Math.PI * r;
@@ -1340,10 +1381,11 @@ ${metrics.sourcesRead.length ? `<table><tbody>${metrics.sourcesRead.map((s) => {
 <text class="v" x="118" y="44">agree: ${num(va.numerator)}</text><text class="v" x="118" y="64">disagree: ${num(va.rest)}</text><text x="118" y="84">of ${plural(va.denominator, 'story', 'stories')}</text></svg>
 ${va.disagree.length ? `<p class="small">Disagree: ${va.disagree.map(esc).join(', ')}.</p>` : ''}`;
   }
+  ring += `<p class="small">Proposed as needs-info or watch, not scored: left for you to decide: ${num(va.leftToOwner ?? 0)} of ${plural(va.withBoth ?? 0, 'story', 'stories')}.</p>`;
   const hu = c.assessed.heldUpBar;
   const huParts = [[hu.unchanged, 'good', 'unchanged'], [hu.tierChanged, 'critical', 'tier changed'], [hu.blastRadiusChanged, 'serious', 'blast radius changed'], [hu.verdictChanged, 'warning', 'verdict changed']];
   const huTotal = hu.unchanged + hu.tierChanged + hu.blastRadiusChanged + hu.verdictChanged;
-  out.push(`<section><h2>Was the assessment right?</h2><div class="grid"><div><h3>Verdict agreement</h3><p class="small">The agent's proposed verdict against the owner's: ${countsWords(va)}.</p>${ring}</div>
+  out.push(`<section><h2>Was the assessment right?</h2><div class="grid"><div><h3>Verdict agreement</h3><p class="small">The agent's proposed verdict against the owner's, for proposals of affected or not affected: ${countsWords(va)}.</p>${ring}</div>
 <div><h3>Did the first assessment hold up</h3><p class="small">Closed stories with a Final line and a first state line: ${countsWords(c.assessed.measures.heldUp)} kept tier and blast radius. Each story is in one group, tier first.</p>
 ${huTotal ? `${legend(huParts.map(([, col, l]) => [0, col, l]))}${hbar(huParts, huTotal, 300)}<p class="small">${partsWords(huParts)}</p>` : '<p class="muted">No closed story has both lines yet.</p>'}
 ${metrics.changed.length ? `<ul class="measures">${metrics.changed.map((ch) => `<li>${esc(ch.key)}: ${ch.changes.map((x) => `${esc(x.field)} ${esc(x.first)} → ${esc(x.final)}`).join('; ')}</li>`).join('')}</ul>` : ''}</div></div></section>`);
@@ -1368,6 +1410,7 @@ function auditPart(metrics) {
       const why = card.report === 'daily' ? `the daily report of ${esc(card.chargedTo)} could have found it and did not`
         : card.report === 'no report' ? `no report that day (${esc(card.chargedTo)})`
           : card.report === 'not yet due' ? `became available too late for a daily report yet (${esc(card.chargedTo)})`
+            : card.report === BEFORE_BEGAN ? 'before measuring began: it became available before the run log\'s first scorecard, so it is charged to no report'
             : 'not charged to a report: its Available date is not recorded';
       return `<div class="card"><b>${esc(card.key)}: ${esc(card.summary)}</b><br>Tier ${esc(card.tier)}. Why it was missed: ${why}.<br>${esc(card.action)}${card.problems.length ? `<br><span class="small">${card.problems.map(esc).join('; ')}</span>` : ''}</div>`;
     }).join('');
@@ -1542,7 +1585,7 @@ ${weekRows.map(([name, , t]) => `<tr><td>${esc(name)}</td><td class="n">${sumCel
 <li>Time from a story to its verdict is not shown: it needs each story's history.</li>
 <li>A quiet week means nothing found by these sources, not that nothing happened.</li>
 <li>Scores cover the news watch only: the daily light check, the Friday audit and the digest. The app scan's stories are in part C only.</li>
-<li>Stories logged before 2026-11-21 lack the new labels and lines, so they are left out of the scores; how many is in the header.</li>
+<li>${esc("Stories logged before 2026-11-21 were labelled afterwards from their own text, by a chat session with the owner's OK. 14 early stories that were not news-watch findings (repo reviews, dry runs, a test example and a laptop-scan finding) have no found-by label and are left out.")}</li>
 <li>Small counts swing scores, which is why counts are shown beside every score.</li>
 <li>Past weeks are scored from the stories as they are today, not as they were that week.</li>
 </ul></section>`);

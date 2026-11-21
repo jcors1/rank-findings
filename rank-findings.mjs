@@ -476,6 +476,16 @@ function checkUnique(list, what) {
 // The Tier 4 findings are never ranked: their IDs are in `ignored`, as
 // before, and `unmatchedLines` gives them as report lines, in the order and
 // with the cap of "Unmatched events (Tier 4 lines)".
+// The verdict step of the Tier 4 line order. "cannot tell" above "does not
+// apply" is the owner's (2026-11-21). Where "applies" and no verdict go is
+// written in by Claude Code, for the owner to correct: "applies" first, and a
+// line with no verdict last.
+const LINE_VERDICTS = ['applies', 'cannot tell', 'does not apply'];
+function lineVerdictIndex(verdict) {
+  const i = LINE_VERDICTS.indexOf(verdict);
+  return i === -1 ? LINE_VERDICTS.length : i;
+}
+
 export function rankRun({ findings: given = [], carried = [], existingStories = {}, cap = STORY_CAP } = {}) {
   const { findings, merged } = mergeSources(given);
   checkUnique(carried, 'carried');
@@ -503,12 +513,15 @@ export function rankRun({ findings: given = [], carried = [], existingStories = 
   const ignored = fresh.filter((f) => f.tier === 4).map((f) => f.id).sort(compareIds);
   const pool = fresh.filter((f) => f.tier !== 4);
 
-  // Tier 4 lines: exploitation (the rank step's order), then severity, then
-  // newest first, then finding ID. Each line carries its verdict and reasons.
+  // Tier 4 lines: verdict ("cannot tell" above "does not apply"; owner
+  // decision 2026-11-21), then exploitation (the rank step's order), then
+  // severity, then newest first, then finding ID. Each line carries its
+  // verdict and reasons.
   const unmatched = fresh
     .filter((f) => f.tier === 4)
-    .map((f) => ({ f, exploitation: scaleIndex('exploitation', f.exploitation), severity: SEVERITIES.indexOf(severityOf(f)) }))
-    .sort((a, b) => a.exploitation - b.exploitation
+    .map((f) => ({ f, verdict: lineVerdictIndex(f.verdict), exploitation: scaleIndex('exploitation', f.exploitation), severity: SEVERITIES.indexOf(severityOf(f)) }))
+    .sort((a, b) => a.verdict - b.verdict
+      || a.exploitation - b.exploitation
       || a.severity - b.severity
       || (a.f.dateSeen < b.f.dateSeen ? 1 : a.f.dateSeen > b.f.dateSeen ? -1 : 0)
       || compareIds(a.f.id, b.f.id))

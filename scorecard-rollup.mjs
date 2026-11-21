@@ -18,6 +18,7 @@
 //   node tools/scorecard-rollup.mjs --comments <comments.json>
 //        [--stories <stories.json>] [--required <required.json>]
 //        [--targets <targets.json>] [--audit-stories <keys.json>]
+//        [--measuring-from <YYYY-MM-DD>]
 //        --days <n> [--now <ISO time>] --out <folder>
 //
 // Input 1, comments.json: one JSON list, every comment of the run-log
@@ -77,9 +78,11 @@
 //     "window": { "from", "to", "days", "now", "timeZone", "dates": [...] },
 //     "input": { "comments", "scorecards", "withoutScorecard",
 //                "unreadable": [ { "created", "reason" } ] },
-//     "measuringFrom": the date of the first scorecard block in the comments
-//                (the earliest "date:" line, a review block's included), or
-//                null when there is none,
+//     "measuringFrom": the date measuring started: --measuring-from when
+//                given (the owner's date, from agents/home-systems.md,
+//                "Confidence scores", "When measuring starts"), else the
+//                earliest "date:" among the daily scorecards (run: daily;
+//                never a review, digest or audit block), else null,
 //     "days": [ { "date", "runs": [ <run> ] } ],     one per date in the window
 //     "missingDaily": [ dates in the window with no daily scorecard ],
 //     "duplicates": [ { "run", "date", "created": [...] } ],
@@ -104,8 +107,9 @@
 //     "misses": [ { "key", "foundBy", "available", "chargedTo", "report",
 //                   "inGrid" } ],
 //       "report" is "daily", "no report", "not yet due", "not charged" (no
-//       Available date) or "before measuring began" (available before
-//       "measuringFrom"; charged to no report, still in the catch rate).
+//       Available date) or "before measuring began" (the day after its
+//       Available date is before "measuringFrom"; charged to no report,
+//       still in the catch rate).
 //     "changed": [ { "key", "changes": [ { "field", "first", "final" } ] } ],
 //     "timeToSurface": [ { "how", "days", "median" } ],
 //     "sourcesRead": [ { "source", "read", "failed", "unknown", "required" } ],
@@ -128,6 +132,11 @@
 // "no report"; "Verdict agreement" scores only proposals of affected or
 // not-affected, and gives "leftToOwner" (proposed needs-info or watch) out of
 // "withBoth" (stories with both a proposed-* and a verdict-* label).
+// Since handoff 2026-11-21-small-fixes: "measuringFrom" comes from
+// --measuring-from, else the first daily scorecard; a miss is "before
+// measuring began" only when the day after its Available date is before
+// "measuringFrom"; "heldUpBar" gives "settledByOwner", the stories counted as
+// unchanged whose needs-info or watch proposal the Final line settled.
 // <run> is one scorecard: "run", "date", "created", "procedureCommit",
 // "status" (VALID, FAILED or "unknown"), "sourcesListed", "readInFull",
 // "readInPart", "searchedOnly", "couldNotCheck", "inventoryRead", "events",
@@ -573,7 +582,7 @@ function noExtraResearchOf(affected) {
 }
 
 function fixedInTimeOf(affected, targets) {
-  if (targets === undefined) return noData('no target days given (--targets): KAN-118, "Alert tiers", does not state them yet');
+  if (targets === undefined) return noData('no target days given (--targets, from KAN-118, "Alert tiers")');
   const withFinal = affected.filter((s) => s.closed && s.final !== NR);
   const eligible = withFinal.filter((s) => s.final.fixed !== 'none' && targets[String(s.final.tier)] !== undefined && s.createdDate !== null);
   const inTime = eligible.filter((s) => dayNumber(s.final.fixed) - dayNumber(s.createdDate) <= targets[String(s.final.tier)]);
@@ -586,15 +595,15 @@ const dailyOn = (cards, date) => cards.filter((c) => c.run === 'daily' && c.date
 const requiredRead = (card, required) => Array.isArray(card.sources)
   && required.every((name) => card.sources.some((s) => sourceKey(s.name) === sourceKey(name) && READ.includes(s.result)));
 
-// Required sources over the dates on or after the start of measuring (the
-// first scorecard in the run log): a date before it is not a failed day.
+// Required sources over the dates on or after the start of measuring
+// ("measuringFrom"): a date before it is not a failed day.
 const measuring = (ctx, date) => ctx.measuringFrom !== null && date >= ctx.measuringFrom;
 function requiredSourcesOf(ctx, dates) {
   if (ctx.required === undefined) return noData('no list of required sources given (--required)');
   const counted = dates.filter((date) => measuring(ctx, date));
   const daysBeforeMeasuring = dates.length - counted.length;
   if (counted.length === 0) {
-    return noData(ctx.measuringFrom === null ? 'no scorecard in the run log yet, so measuring has not begun' : `every day of the window is before measuring began (${ctx.measuringFrom})`, { leftOut: 0, daysWithoutScorecard: 0, daysBeforeMeasuring });
+    return noData(ctx.measuringFrom === null ? 'no start date given and no daily scorecard in the run log yet, so measuring has not begun' : `every day of the window is before measuring began (${ctx.measuringFrom})`, { leftOut: 0, daysWithoutScorecard: 0, daysBeforeMeasuring });
   }
   const passed = counted.filter((date) => { const card = dailyOn(ctx.cards, date); return card !== undefined && requiredRead(card, ctx.required); });
   return measure(passed.length, counted.length, { leftOut: 0, daysWithoutScorecard: counted.filter((date) => dailyOn(ctx.cards, date) === undefined).length, daysBeforeMeasuring });
@@ -631,8 +640,9 @@ function scoresFor(ctx, to) {
 }
 
 // Each miss (a story found by the audit or the owner) is charged to the daily
-// report due the day after it became available, unless it became available
-// before measuring began: then it is charged to no report.
+// report due the day after it became available, unless that day is before
+// measuring began: then it is charged to no report. So an item available on
+// the day before the start is charged to the first daily report.
 const BEFORE = 'before measuring';
 const BEFORE_BEGAN = 'before measuring began';
 function missesOf(ctx, to) {
@@ -640,8 +650,8 @@ function missesOf(ctx, to) {
     .filter((s) => s.foundBy === 'audit' || s.foundBy === 'owner')
     .map((s) => {
       if (s.available === NR || s.available === 'unknown') return { key: s.key, foundBy: s.foundBy, available: s.available, chargedTo: null, report: 'not charged' };
-      if (!measuring(ctx, s.available.date)) return { key: s.key, foundBy: s.foundBy, available: s.available.date, chargedTo: null, report: BEFORE_BEGAN };
       const chargedTo = dateOf(dayNumber(s.available.date) + 1);
+      if (!measuring(ctx, chargedTo)) return { key: s.key, foundBy: s.foundBy, available: s.available.date, chargedTo: null, report: BEFORE_BEGAN };
       const report = chargedTo > to ? 'not yet due' : dailyOn(ctx.cards, chargedTo) ? 'daily' : 'no report';
       return { key: s.key, foundBy: s.foundBy, available: s.available.date, chargedTo, report };
     });
@@ -650,7 +660,9 @@ function missesOf(ctx, to) {
 // One row of the per-report grid.
 function reportRow(ctx, card, date, run, misses) {
   const charged = run === 'daily' ? misses.filter((m) => m.chargedTo === date).map((m) => m.key) : [];
-  if (!card) {
+  // A report dated before the start (possible when --measuring-from is later
+  // than the first scorecard) is not measured either.
+  if (!card || !measuring(ctx, date)) {
     const word = measuring(ctx, date) ? 'no report' : BEFORE;
     const none = { score: word, band: word };
     return { date, run, report: false, beforeMeasuring: word === BEFORE, found: none, assessed: none, actionable: none, overall: none, stories: [], misses: charged };
@@ -704,14 +716,20 @@ function reviewOf(ctx, to) {
   // Held up, as one bar: each closed story with both lines in one group.
   const both = now.scoped.filter((s) => s.closed && s.final !== NR && s.firstState !== NR);
   const changed = [];
-  const heldUpBar = { unchanged: 0, tierChanged: 0, blastRadiusChanged: 0, verdictChanged: 0 };
+  // A needs-info or watch proposal that the Final line settles is not a
+  // changed verdict (owner decision 2026-11-21): with tier and blast radius
+  // kept it is "unchanged", and counted in "settledByOwner".
+  const heldUpBar = { unchanged: 0, tierChanged: 0, blastRadiusChanged: 0, verdictChanged: 0, settledByOwner: 0 };
   for (const s of both) {
     const changes = [];
     if (s.firstState.tier !== s.final.tier) changes.push({ field: 'tier', first: String(s.firstState.tier), final: String(s.final.tier) });
     if (!same(s.firstState.blastRadius, s.final.blastRadius)) changes.push({ field: 'blast radius', first: s.firstState.blastRadius, final: s.final.blastRadius });
-    if (s.proposed !== NR && s.proposed !== s.final.verdict) changes.push({ field: 'verdict', first: s.proposed, final: s.final.verdict });
+    const settled = s.proposed !== NR && !DEFINITE.includes(s.proposed) && s.proposed !== s.final.verdict;
+    if (s.proposed !== NR && s.proposed !== s.final.verdict && !settled) changes.push({ field: 'verdict', first: s.proposed, final: s.final.verdict });
     const fields = changes.map((c) => c.field);
-    heldUpBar[fields.includes('tier') ? 'tierChanged' : fields.includes('blast radius') ? 'blastRadiusChanged' : fields.includes('verdict') ? 'verdictChanged' : 'unchanged'] += 1;
+    const group = fields.includes('tier') ? 'tierChanged' : fields.includes('blast radius') ? 'blastRadiusChanged' : fields.includes('verdict') ? 'verdictChanged' : 'unchanged';
+    heldUpBar[group] += 1;
+    if (group === 'unchanged' && settled) heldUpBar.settledByOwner += 1;
     if (changes.length > 0) changed.push({ key: s.key, changes });
   }
   now.assessed.heldUpBar = heldUpBar;
@@ -899,8 +917,9 @@ function checkStory(raw, n) {
 // Everything in metrics.json. `comments` and `stories` are the two input
 // lists as read; `days` is the window in days; `now` is an ISO time.
 // `required`, `targets` and `auditStories` are the three optional inputs of
-// the review page (--required, --targets, --audit-stories).
-export function rollup({ comments, stories, days, now, required, targets, auditStories }) {
+// the review page (--required, --targets, --audit-stories); `measuringFrom`
+// is the owner's start date (--measuring-from), optional.
+export function rollup({ comments, stories, days, now, required, targets, auditStories, measuringFrom: startGiven }) {
   if (!Number.isInteger(days) || days < 1) throw new Error('--days must be a whole number of days, 1 or more');
   const nowMs = timeOf(now);
   if (Number.isNaN(nowMs)) throw new Error(`--now is not a time that can be read: ${now}`);
@@ -908,6 +927,7 @@ export function rollup({ comments, stories, days, now, required, targets, auditS
   const requiredList = checkRequired(required);
   const targetDays = checkTargets(targets);
   const auditKeys = checkAuditStories(auditStories);
+  if (startGiven !== undefined && !isDate(startGiven)) throw new Error(`--measuring-from must be a real date, YYYY-MM-DD: ${startGiven}`);
 
   const cards = [];
   const reviews = [];
@@ -996,10 +1016,9 @@ export function rollup({ comments, stories, days, now, required, targets, auditS
   reviews.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.createdMs - b.createdMs));
   const reviewWeeks = new Map();
   for (const r of reviews) reviewWeeks.set(r.week, (reviewWeeks.get(r.week) ?? 0) + 1);
-  // Measuring starts on the date of the first scorecard in the run log: the
-  // earliest "date:" of every readable block, the review's included.
-  const blockDates = [...ordered.map((card) => card.date), ...reviews.map((r) => r.date)].sort();
-  const measuringFrom = blockDates[0] ?? null;
+  // Measuring starts on the owner's date when the run passes it in; else on
+  // the earliest daily scorecard, never a review, digest or audit block.
+  const measuringFrom = startGiven ?? ordered.find((card) => card.run === 'daily')?.date ?? null;
   const review = reviewOf({ cards: ordered, stories: parsed, reviews, required: requiredList, targets: targetDays, auditStories: auditKeys, measuringFrom }, to);
   const shapes = new Set(parsed.map((s) => (s.oldShape ? 'open stories only' : 'full')));
 
@@ -1306,7 +1325,7 @@ function reportCardPart(metrics) {
     return `<tr><td class="nw">${esc(r.date)}</td><td class="nw">${esc(r.run)}${r.duplicate ? ' (two scorecards: newest used)' : ''}</td><td>${reportCell(f, detail)}</td><td>${reportCell(r.assessed)}</td><td>${reportCell(r.actionable)}</td><td>${reportCell(r.overall)}</td><td>${r.stories.length ? `stories: ${r.stories.map(esc).join(', ')}` : ''}${r.misses.length ? `${r.stories.length ? '<br>' : ''}missed: ${r.misses.map(esc).join(', ')}` : ''}</td></tr>`;
   });
   const uncharged = metrics.misses.filter((m) => !m.inGrid);
-  out.push(`<section><h2>Each report, last 8 days</h2><p class="sub">The daily light check on every date, and each digest. "n/a": the report created no story. "provisional": the owner has not finished with its stories yet. "before measuring": a day before the run log's first scorecard${metrics.measuringFrom ? ` (${esc(metrics.measuringFrom)})` : ''}; it is not a missing report.</p>
+  out.push(`<section><h2>Each report, last 8 days</h2><p class="sub">The daily light check on every date, and each digest. "n/a": the report created no story. "provisional": the owner has not finished with its stories yet. "before measuring": a day before measuring began${metrics.measuringFrom ? ` (${esc(metrics.measuringFrom)})` : ''}; it is not a missing report.</p>
 <table><thead><tr><th class="nw">Date</th><th class="nw">Run</th><th>Found</th><th>Assessed</th><th>Actionable</th><th>Overall</th><th>Stories and misses</th></tr></thead><tbody>${rows.join('\n')}</tbody></table>
 ${uncharged.length ? `<p class="small">Misses not charged to these 8 days: ${uncharged.map((m) => `${esc(m.key)} (${m.chargedTo ? `charged to ${esc(m.chargedTo)}, ${esc(m.report)}` : esc(m.report)})`).join('; ')}.</p>` : ''}</section>`);
 
@@ -1387,7 +1406,7 @@ ${va.disagree.length ? `<p class="small">Disagree: ${va.disagree.map(esc).join('
   const huTotal = hu.unchanged + hu.tierChanged + hu.blastRadiusChanged + hu.verdictChanged;
   out.push(`<section><h2>Was the assessment right?</h2><div class="grid"><div><h3>Verdict agreement</h3><p class="small">The agent's proposed verdict against the owner's, for proposals of affected or not affected: ${countsWords(va)}.</p>${ring}</div>
 <div><h3>Did the first assessment hold up</h3><p class="small">Closed stories with a Final line and a first state line: ${countsWords(c.assessed.measures.heldUp)} kept tier and blast radius. Each story is in one group, tier first.</p>
-${huTotal ? `${legend(huParts.map(([, col, l]) => [0, col, l]))}${hbar(huParts, huTotal, 300)}<p class="small">${partsWords(huParts)}</p>` : '<p class="muted">No closed story has both lines yet.</p>'}
+${huTotal ? `${legend(huParts.map(([, col, l]) => [0, col, l]))}${hbar(huParts, huTotal, 300)}<p class="small">${partsWords(huParts)}${hu.settledByOwner ? `; unchanged includes ${num(hu.settledByOwner)} settled by you from needs-info or watch` : ''}</p>` : '<p class="muted">No closed story has both lines yet.</p>'}
 ${metrics.changed.length ? `<ul class="measures">${metrics.changed.map((ch) => `<li>${esc(ch.key)}: ${ch.changes.map((x) => `${esc(x.field)} ${esc(x.first)} → ${esc(x.final)}`).join('; ')}</li>`).join('')}</ul>` : ''}</div></div></section>`);
 
   const a = c.actionable.measures;
@@ -1410,7 +1429,7 @@ function auditPart(metrics) {
       const why = card.report === 'daily' ? `the daily report of ${esc(card.chargedTo)} could have found it and did not`
         : card.report === 'no report' ? `no report that day (${esc(card.chargedTo)})`
           : card.report === 'not yet due' ? `became available too late for a daily report yet (${esc(card.chargedTo)})`
-            : card.report === BEFORE_BEGAN ? 'before measuring began: it became available before the run log\'s first scorecard, so it is charged to no report'
+            : card.report === BEFORE_BEGAN ? 'before measuring began: the daily report due the day after it became available was before measuring began, so it is charged to no report'
             : 'not charged to a report: its Available date is not recorded';
       return `<div class="card"><b>${esc(card.key)}: ${esc(card.summary)}</b><br>Tier ${esc(card.tier)}. Why it was missed: ${why}.<br>${esc(card.action)}${card.problems.length ? `<br><span class="small">${card.problems.map(esc).join('; ')}</span>` : ''}</div>`;
     }).join('');
@@ -1603,13 +1622,13 @@ ${out.join('\n')}
 // ---- the command line ----
 
 function parseArgs(args) {
-  const usage = 'usage: --comments <comments.json> [--stories <stories.json>] [--required <required.json>] [--targets <targets.json>] [--audit-stories <keys.json>] --days <n> [--now <ISO time>] --out <folder>';
+  const usage = 'usage: --comments <comments.json> [--stories <stories.json>] [--required <required.json>] [--targets <targets.json>] [--audit-stories <keys.json>] [--measuring-from <YYYY-MM-DD>] --days <n> [--now <ISO time>] --out <folder>';
   const options = {};
   for (let i = 0; i < args.length; i += 2) {
     const name = args[i];
-    if (!['--comments', '--stories', '--required', '--targets', '--audit-stories', '--days', '--now', '--out'].includes(name)) throw new Error(`unknown option "${name}"; ${usage}`);
+    if (!['--comments', '--stories', '--required', '--targets', '--audit-stories', '--measuring-from', '--days', '--now', '--out'].includes(name)) throw new Error(`unknown option "${name}"; ${usage}`);
     if (args[i + 1] === undefined) throw new Error(`${name} needs a value`);
-    options[name.slice(2).replace('audit-stories', 'auditStories')] = args[i + 1];
+    options[name.slice(2).replace('audit-stories', 'auditStories').replace('measuring-from', 'measuringFrom')] = args[i + 1];
   }
   if (options.comments === undefined) throw new Error(`--comments <comments.json> is required; ${usage}`);
   if (options.days === undefined) throw new Error(`--days <n> is required; ${usage}`);
@@ -1633,7 +1652,7 @@ function main(args) {
   const required = options.required === undefined ? undefined : readJson(options.required, 'required sources');
   const targets = options.targets === undefined ? undefined : readJson(options.targets, 'targets');
   const auditStories = options.auditStories === undefined ? undefined : readJson(options.auditStories, 'audit stories');
-  const metricsText = `${JSON.stringify(rollup({ comments, stories, days: options.days, now: options.now, required, targets, auditStories }), null, 2)}\n`;
+  const metricsText = `${JSON.stringify(rollup({ comments, stories, days: options.days, now: options.now, required, targets, auditStories, measuringFrom: options.measuringFrom }), null, 2)}\n`;
   // The page is drawn from the text that is written, so the two cannot differ.
   const html = renderDashboard(JSON.parse(metricsText));
   mkdirSync(options.out, { recursive: true });
